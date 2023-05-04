@@ -1,0 +1,298 @@
+---
+layout: post
+title:  "Compressing YUV 4:2:2 Video Frame to HEIF in C"
+date:   2023-05-03 20:48:00 +0200
+categories: video
+---
+
+Recently, I was working with a YUV 4:2:2 video frame obtained from Video4Linux, and my objective was to compress it into HEIF format so that it could be transmitted over a network. However I struggled to find clear instructions on how to compress YUV 4:2:2 image buffer to a HEIF buffer. It took me a full day of trial and error to figure out the process, and while my solution may not be the best or most optimized, I hope it will be helpful to others who are trying to achieve the same result.
+
+In this post, I'll show the steps to compress and decompress a YUV 4:2:2 image buffer into a HEIF buffer using the libheif library. 
+
+Nota bene: Please note that this solution was tested on Ubuntu 23.04 with libheif-dev version 1.14.2 installed, and while it may work on other systems and versions, it has only been tested in this environment. As with any code, it is always recommended to test thoroughly before deploying in a production environment.
+
+Make sure to install libheif-dev
+{% highlight co      		nsole %}
+sudo apt install libheif-dev
+{% endhighlight %}
+
+The C code
+{% highlight c %}
+#include <libheif/heif.h>
+
+// the compressed buffer will be hold into a struct
+struct mybuffer
+{
+    uint8_t* data;
+    size_t size;
+};
+
+/**
+ * Exit ungracefully if an error is reported
+ * @param err   Pointer to struct heif_error*      
+ */
+void die_if_heif_error(struct heif_error* err)
+{
+    if (err->code != heif_error_Ok)
+    {
+        printf("Error (%d): %s\n", err->code, err->message);
+        exit(1);
+    }
+}
+
+/**
+ * Exit ungracefully if memory couldn't be allocated
+ * @param ptr   Pointer to some memory
+ */
+void die_if_null_pointer(void* ptr)
+{
+    if (ptr == NULL)
+    {
+        printf("Unable to allocate memory\n");
+        exit(1);
+    }
+}
+
+/** 
+ * Callback function that writes an Heif image to a userdefined buffer
+ * @param ctx                   Pointer to struct heif_context
+ * @param data                  pointer to some data 
+ * @param size                  size of data
+ * @param userdata              Pointer to userdata (in our case struct 
+ *                              mybuffer*)
+ * @return struct heif_error    error reporting structure
+ */
+struct heif_error heif_image_write_to_buffer(struct heif_context* ctx,
+                                             const void* data,
+                                             size_t size,
+                                             void* userdata)
+{
+    struct heif_error err;
+    memset(&err, 0, sizeof (err));
+
+    // This is the bit where I don't know how many times this callback 
+    // is going to get called!!
+    // so to be on the safe side I am going to realloc the buffer
+    // if it gets called more than once.
+    struct byteBuffer* buf = (struct byteBuffer*) userdata;
+    uint8_t* ptr = NULL;
+
+    if (buf->size == 0)
+    {
+        ptr = malloc(size * sizeof (*ptr));
+    }
+    else
+    {
+        ptr = realloc(buf->data, buf->size + size);
+    }
+
+    if (ptr == NULL)
+    {
+        err.code = heif_error_Memory_allocation_error;
+    }
+    else
+    {
+        buf->data = ptr;
+        memcpy(buf->data + buf->size, (uint8_t*) data, size);
+        buf->size += size;
+    }
+    return err;
+}
+
+/**
+ * Push a YUV4:2:2 frame into a HEIF image and then compress it. 
+ * @param yuv422_buffer         pointer to YUV4:2:2 Buffer 
+ * @param width                 Frame width
+ * @param height                Frame height
+ * @param quality               Compression quality
+ * @param comp_buffer     Structure holding the compressed buffer
+ */
+void YUV422_compress_HEIF(uint8_t* yuv422_buffer,
+                          int width, int height,
+                          int quality,
+                          struct byteBuffer * comp_buffer)
+{
+    // error reporting structure
+    struct heif_error err;
+
+    // create a heif_context
+    struct heif_context* ctx = heif_context_alloc();
+    die_if_null_pointer((void*) ctx);
+
+    // create an encoder
+    struct heif_encoder* encoder;
+    err = heif_context_get_encoder_for_format(ctx,
+                                              heif_compression_HEVC, &encoder);
+    die_if_heif_error(&err);
+
+    // Set the encoding quality
+    err = heif_encoder_set_lossy_quality(encoder, quality);
+    die_if_heif_error(&err);
+
+    // Create HEIF image
+    struct heif_image* heif_image = NULL;
+    err = heif_image_create(width, height, heif_colorspace_YCbCr,
+                            heif_chroma_422, &heif_image);
+    die_if_heif_error(&err);
+
+    // Add YUV planes to HEIF image
+    int bit_depth = 8;
+    err = heif_image_add_plane(heif_image, heif_channel_Y,
+                               width, height, bit_depth);
+    die_if_heif_error(&err);
+
+    err = heif_image_add_plane(heif_image, heif_channel_Cb,
+                               width / 2, height, bit_depth);
+    die_if_heif_error(&err);
+
+    err = heif_image_add_plane(heif_image, heif_channel_Cr,
+                               width / 2, height, bit_depth);
+    die_if_heif_error(&err);
+
+    // now get the planes
+    uint8_t* y_plane = heif_image_get_plane(heif_image, heif_channel_Y, NULL);
+    die_if_null_pointer((void*) y_plane);
+
+    uint8_t* u_plane = heif_image_get_plane(heif_image, heif_channel_Cb, NULL);
+    die_if_null_pointer((void*) u_plane);
+
+    uint8_t* v_plane = heif_image_get_plane(heif_image, heif_channel_Cr, NULL);
+    die_if_null_pointer((void*) v_plane);
+
+    // Convert YUV422 to planar YUV
+    for (int i = 0; i < height; i++)
+    {
+        for (int j = 0; j < width; j += 2)
+        {
+            int y_index = i * width + j;
+            int u_index = i * (width / 2) + j / 2;
+            int v_index = u_index;
+            y_plane[y_index] = yuv422_buffer[y_index * 2];
+            y_plane[y_index + 1] = yuv422_buffer[y_index * 2 + 2];
+            u_plane[u_index] = yuv422_buffer[y_index * 2 + 1];
+            v_plane[v_index] = yuv422_buffer[y_index * 2 + 3];
+        }
+    }
+    // encode input image.
+    struct heif_image_handle* handle;
+    err = heif_context_encode_image(ctx, heif_image, encoder, NULL, &handle);
+    die_if_heif_error(&err);
+
+    // at this point we need to declare a struct for a callback function
+    struct heif_writer writer;
+    writer.write = &heif_image_write_to_buffer;
+    writer.writer_api_version = 1; // why? 
+    // now encode the compressed image into a user defined buffer
+    err = heif_context_write(ctx, &writer, (void*) comp_buffer);
+    die_if_heif_error(&err);
+
+    // release memory
+    heif_image_handle_release(handle);
+    heif_encoder_release(encoder);
+    heif_image_release(heif_image);
+    heif_context_free(ctx);
+}
+
+//
+// somewhere in the code
+//
+{
+
+	// some code
+	heif_init(NULL);
+
+        struct mybuffer compressed_buf;
+        memset(&compressed_buf, 0, sizeof (compressed_buf));
+
+        YUV422_compress_HEIF(in_buffer,
+                             width, height,
+                             VIDEO_QUALITY,
+                             &compressed_buf);
+       	//                      
+	// do something with compressed_buf
+	//
+        free(compressed_buf.data);
+
+	heif_deinit();
+}
+{% endhighlight %}
+
+
+Decompressing a HEIF file stored in memory to a YUV4:2:2 Frame buffer
+follows those steps
+{% highlight c %}
+/**
+ *  Decompress a HEIF file stored in memory to a YUV4:2:2 buffer
+ * @param in_buffer         Pointer to the HEIF data
+ * @param in_len            Size of the HEIF data
+ * @param yuv422_buffer     Pointer to YUV4:2:2 bytebuffer Structure
+ */
+void HEIF_decompress_YUV422(uint8_t* in_buffer,
+                            int in_len,
+                            struct byteBuffer* yuv422_buffer)
+{
+    // error reporting structure
+    struct heif_error err;
+    // Initialize a HEIF decoder context
+    struct heif_context* ctx = heif_context_alloc();
+    die_if_null_pointer((void*) ctx);
+    // read our incoming buffer
+    heif_context_read_from_memory_without_copy(ctx, in_buffer, in_len, NULL);
+    // Get the primary image handle from the context
+    struct heif_image_handle* handle = NULL;
+    err = heif_context_get_primary_image_handle(ctx, &handle);
+    die_if_heif_error(&err);
+    // Decode the image into a HEIF image object
+    struct heif_image* image = NULL;
+    err = heif_decode_image(handle, &image, 
+                            heif_colorspace_YCbCr, heif_chroma_422, NULL);
+    die_if_heif_error(&err);
+    // Get the HEIF image data and its planes
+    int width = heif_image_get_width(image, heif_channel_Y);
+    int height = heif_image_get_height(image, heif_channel_Y);
+    const uint8_t* y_plane = heif_image_get_plane(image, heif_channel_Y, 0);
+    die_if_null_pointer((void*) y_plane);
+    const uint8_t* u_plane = heif_image_get_plane(image, heif_channel_Cb, 0);
+    die_if_null_pointer((void*) u_plane);
+    const uint8_t* v_plane = heif_image_get_plane(image, heif_channel_Cr, 0);
+    die_if_null_pointer((void*) v_plane);
+    // allocate memory of our yuv422_buffer
+    yuv422_buffer->size = width * height * 2;
+    yuv422_buffer->data = malloc(yuv422_buffer->size *
+                                 sizeof (*yuv422_buffer->data));
+    die_if_null_pointer(yuv422_buffer->data);
+    // now push the data into our yuv422_buffer
+    int y_index = 0;
+    int u_index = 0;
+    int v_index = 0;
+    int buffer_index = 0;
+
+    for (int i = 0; i < height; i++)
+    {
+        for (int j = 0; j < width; j += 2)
+        {
+            yuv422_buffer->data[buffer_index] = y_plane[y_index];
+            yuv422_buffer->data[buffer_index + 1] = u_plane[u_index];
+            yuv422_buffer->data[buffer_index + 2] = y_plane[y_index + 1];
+            yuv422_buffer->data[buffer_index + 3] = v_plane[v_index];
+            buffer_index += 4;
+            y_index += 2;
+            u_index++;
+            v_index++;
+        }
+    }
+    // Free the HEIF objects
+    heif_image_release(image);
+    heif_image_handle_release(handle);
+    heif_context_free(ctx);
+}
+{% endhighlight %}
+
+
+
+
+
+
+
+
+
